@@ -5,6 +5,9 @@ import os
 import sys
 import json
 from datetime import datetime
+from docx import Document # For Word report
+from docx.shared import Inches, Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 class CleanItApp:
     CONFIG_FILE = os.path.join(os.path.expanduser('~'), '.cleanit_config.json')
@@ -50,7 +53,7 @@ class CleanItApp:
                        background=[('selected', self.bg_color), ('active', '#A3D9F7')],
                        foreground=[('selected', self.fg_color)])
 
-        # Treeview style for missing values
+        # Treeview style for missing values and duplicate review
         self.style.configure("Treeview",
                              background="white",
                              foreground="black",
@@ -64,13 +67,14 @@ class CleanItApp:
                              background='#A3D9F7',
                              foreground=self.fg_color)
 
-
         # --- Variables ---
         self.input_file_path = tk.StringVar()
         self.output_folder_path = tk.StringVar()
+        self.df = None # The DataFrame itself, now a class attribute
 
-        # The DataFrame itself, now a class attribute
-        self.df = None
+        # Output Format Variables
+        self.output_file_format = tk.StringVar(value=".xlsx") # Default to XLSX
+        self.generate_report = tk.BooleanVar(value=True) # Default to generate report
 
         # Date format options
         self._date_format_options = [
@@ -101,15 +105,21 @@ class CleanItApp:
         self.do_capitalize_strings = tk.BooleanVar(value=True)
         self.do_remove_duplicates = tk.BooleanVar(value=True)
 
-
         # Dynamic column checkboxes
         self.date_column_vars = {} # Stores {column_name: tk.BooleanVar} for date formatting
         self.duplicate_check_column_vars = {} # Stores {column_name: tk.BooleanVar} for duplicate detection
 
         # Missing values Treeview related
         self.missing_values_tree = None # Will be initialized in create_widgets
-        self.missing_values_data = {} # Stores original DataFrame index to Treeview iid mapping for editing
+        
+        # Duplicate Review related
+        self.duplicate_review_tree = None # Will be initialized in create_widgets
+        self.duplicate_rows_to_keep_vars = {} # {original_idx: tk.BooleanVar} for rows in self.duplicate_review_df
+        self.duplicate_review_df = None # DataFrame containing only rows involved in duplicates
 
+        # Processing Metrics (for report)
+        self.processing_metrics = {}
+        
         self._load_config() # Load paths on startup
         self.create_widgets()
 
@@ -121,14 +131,18 @@ class CleanItApp:
                     config = json.load(f)
                     self.input_file_path.set(config.get('last_input_file_path', ''))
                     self.output_folder_path.set(config.get('last_output_folder', ''))
+                    self.output_file_format.set(config.get('last_output_format', '.xlsx'))
+                    self.generate_report.set(config.get('generate_report', True))
             except Exception as e:
                 messagebox.showwarning("Config Load Error", f"Could not load configuration: {e}")
 
     def _save_config(self):
-        """Saves current paths to a config file."""
+        """Saves current paths and settings to a config file."""
         config = {
             'last_input_file_path': self.input_file_path.get(),
-            'last_output_folder': self.output_folder_path.get()
+            'last_output_folder': self.output_folder_path.get(),
+            'last_output_format': self.output_file_format.get(),
+            'generate_report': self.generate_report.get()
         }
         try:
             with open(self.CONFIG_FILE, 'w') as f:
@@ -157,6 +171,8 @@ class CleanItApp:
         file_output_tab.grid_columnconfigure(1, weight=1)
         file_output_tab.grid_rowconfigure(0, weight=1)
         file_output_tab.grid_rowconfigure(1, weight=1)
+        file_output_tab.grid_rowconfigure(2, weight=1) # For output format
+        file_output_tab.grid_rowconfigure(3, weight=1) # For report option
 
         ttk.Label(file_output_tab, text="Input File:").grid(row=0, column=0, sticky='w', pady=5)
         self.input_entry = ttk.Entry(file_output_tab, textvariable=self.input_file_path, state='readonly')
@@ -167,6 +183,14 @@ class CleanItApp:
         self.output_entry = ttk.Entry(file_output_tab, textvariable=self.output_folder_path, state='readonly')
         self.output_entry.grid(row=1, column=1, padx=5, pady=5, sticky='ew')
         ttk.Button(file_output_tab, text="Browse...", command=self.browse_output_folder).grid(row=1, column=2, padx=5, pady=5)
+
+        ttk.Label(file_output_tab, text="Output File Format:").grid(row=2, column=0, sticky='w', pady=5)
+        output_format_frame = ttk.Frame(file_output_tab)
+        output_format_frame.grid(row=2, column=1, columnspan=2, sticky='w', padx=5, pady=5)
+        ttk.Radiobutton(output_format_frame, text=".xlsx (Excel)", variable=self.output_file_format, value=".xlsx").pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(output_format_frame, text=".csv (CSV)", variable=self.output_file_format, value=".csv").pack(side=tk.LEFT, padx=5)
+
+        ttk.Checkbutton(file_output_tab, text="Generate Processing Report (.docx)", variable=self.generate_report).grid(row=3, column=0, columnspan=3, sticky='w', pady=10)
 
 
         # --- Tab 2: Cleaning Options ---
@@ -223,9 +247,40 @@ class CleanItApp:
         ttk.Label(self.duplicate_check_columns_frame, text="Load a file to see columns...", background=self.bg_color).pack(pady=10)
 
 
-        # --- Tab 3: Date Formatting --- (MOVED FROM 4)
+        # --- Tab 3: Duplicate Review ---
+        duplicate_review_tab = ttk.Frame(self.notebook, padding="15 15 15 15")
+        self.notebook.add(duplicate_review_tab, text="3. Duplicate Review")
+        duplicate_review_tab.grid_columnconfigure(0, weight=1)
+        duplicate_review_tab.grid_rowconfigure(1, weight=1)
+
+        ttk.Label(duplicate_review_tab, text="Duplicate Rows Found (Check to KEEP, Uncheck to DELETE):",
+                  font=('Helvetica', 10, 'bold'), foreground=self.fg_color).grid(row=0, column=0, sticky='w', pady=(0,5))
+
+        # Treeview for duplicate review
+        duplicate_tree_frame = ttk.Frame(duplicate_review_tab)
+        duplicate_tree_frame.grid(row=1, column=0, sticky='nsew', pady=5)
+        duplicate_tree_frame.grid_rowconfigure(0, weight=1)
+        duplicate_tree_frame.grid_columnconfigure(0, weight=1)
+
+        self.duplicate_review_tree = ttk.Treeview(duplicate_tree_frame, show='headings')
+        self.duplicate_review_tree.grid(row=0, column=0, sticky='nsew')
+
+        vsb_dup = ttk.Scrollbar(duplicate_tree_frame, orient="vertical", command=self.duplicate_review_tree.yview)
+        vsb_dup.grid(row=0, column=1, sticky='ns')
+        hsb_dup = ttk.Scrollbar(duplicate_tree_frame, orient="horizontal", command=self.duplicate_review_tree.xview)
+        hsb_dup.grid(row=1, column=0, sticky='ew')
+
+        self.duplicate_review_tree.configure(yscrollcommand=vsb_dup.set, xscrollcommand=hsb_dup.set)
+        self.duplicate_review_tree.bind("<Button-1>", self._on_duplicate_treeview_click) # Bind click for toggling checkbox
+
+        self.apply_duplicates_button = ttk.Button(duplicate_review_tab, text="Apply Duplicate Changes & Continue", command=self._apply_duplicate_changes)
+        self.apply_duplicates_button.grid(row=2, column=0, pady=10)
+        self.apply_duplicates_button.config(state='disabled') # Disabled until duplicates are found
+
+
+        # --- Tab 4: Date Formatting ---
         date_formatting_tab = ttk.Frame(self.notebook, padding="15 15 15 15")
-        self.notebook.add(date_formatting_tab, text="3. Date Formatting") # Updated tab number
+        self.notebook.add(date_formatting_tab, text="4. Date Formatting")
 
         date_formatting_tab.grid_columnconfigure(1, weight=1)
         date_formatting_tab.grid_rowconfigure(2, weight=1)
@@ -261,9 +316,9 @@ class CleanItApp:
         ttk.Label(self.date_columns_frame, text="Load a file to see columns...", background=self.bg_color).pack(pady=10)
 
 
-        # --- Tab 4: Sorting --- (MOVED FROM 5)
+        # --- Tab 5: Sorting ---
         sorting_tab = ttk.Frame(self.notebook, padding="15 15 15 15")
-        self.notebook.add(sorting_tab, text="4. Sorting") # Updated tab number
+        self.notebook.add(sorting_tab, text="5. Sorting")
 
         sorting_tab.grid_columnconfigure(1, weight=1)
         sorting_tab.grid_rowconfigure(0, weight=1)
@@ -280,9 +335,9 @@ class CleanItApp:
         ttk.Radiobutton(sort_order_frame, text="Descending", variable=self.sort_order, value=False).pack(side=tk.LEFT, padx=5)
 
 
-        # --- Tab 5: Missing Values & Review --- (MOVED FROM 3)
+        # --- Tab 6: Missing Values & Review ---
         missing_values_tab = ttk.Frame(self.notebook, padding="15 15 15 15")
-        self.notebook.add(missing_values_tab, text="5. Missing Values & Review") # Updated tab number
+        self.notebook.add(missing_values_tab, text="6. Missing Values & Review")
         missing_values_tab.grid_columnconfigure(0, weight=1)
         missing_values_tab.grid_rowconfigure(1, weight=1)
 
@@ -304,7 +359,7 @@ class CleanItApp:
         hsb.grid(row=1, column=0, sticky='ew')
 
         self.missing_values_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        self.missing_values_tree.bind("<Button-1>", self._on_treeview_click) # Bind click for editing
+        self.missing_values_tree.bind("<Button-1>", self._on_missing_treeview_click) # Bind click for editing
 
 
         # --- Process Button (outside tabs) ---
@@ -324,7 +379,6 @@ class CleanItApp:
 
         # Try to load initial columns if a file path is already set from config
         if self.input_file_path.get() and os.path.exists(self.input_file_path.get()):
-            # Important: now load the actual DF here so it's available for all steps
             self._load_dataframe_and_update_widgets(self.input_file_path.get())
 
 
@@ -336,8 +390,8 @@ class CleanItApp:
         """Allows mousewheel scrolling for the duplicate check canvas."""
         self.duplicate_check_columns_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
 
-    def _on_treeview_click(self, event):
-        """Handles clicks on the Treeview to enable editing."""
+    def _on_missing_treeview_click(self, event):
+        """Handles clicks on the Missing Values Treeview to enable editing."""
         if self.df is None: return
 
         item = self.missing_values_tree.identify_row(event.y)
@@ -358,19 +412,18 @@ class CleanItApp:
         
         # Check if the actual value in the DataFrame is NaN
         # We only want to open the editor if the cell is currently empty (NaN)
-        if pd.isna(self.df.loc[int(original_df_index), col_name]):
+        current_df_value = self.df.loc[int(original_df_index), col_name]
+
+        if pd.isna(current_df_value):
             # Get bounding box of the cell
             x, y, width, height = self.missing_values_tree.bbox(item, column_id)
 
             # Create an Entry widget over the cell
             entry = ttk.Entry(self.missing_values_tree, style='TEntry') # Use 'TEntry' style
             entry.place(x=x, y=y, width=width, height=height, anchor='nw')
-            # Get the actual value from the DataFrame
-            current_df_value = self.df.loc[int(original_df_index), col_name]
-
+            
             # Insert an empty string if the value is missing (NaN, pd.NA, None, NaT), otherwise convert to string
             entry.insert(0, "" if pd.isna(current_df_value) else str(current_df_value))
-
             entry.focus_set()
 
             def save_edit(event=None):
@@ -408,6 +461,29 @@ class CleanItApp:
             entry.bind("<Return>", save_edit) # Save on Enter key
             entry.bind("<FocusOut>", save_edit) # Save when focus is lost (e.g., clicking away)
 
+    def _on_duplicate_treeview_click(self, event):
+        """Handles clicks on the Duplicate Review Treeview to toggle 'Keep' checkbox."""
+        if self.duplicate_review_df is None: return
+
+        item = self.duplicate_review_tree.identify_row(event.y)
+        column_id = self.duplicate_review_tree.identify_column(event.x)
+
+        if not item or not column_id:
+            return
+
+        # Check if the click was on the "Keep" column (which is the first column, index 0)
+        if int(column_id.replace('#', '')) == 1: # Column index in Treeview is 1-based
+            original_df_index = int(item) # The iid is the original DF index
+
+            # Toggle the BooleanVar
+            current_keep_state = self.duplicate_rows_to_keep_vars[original_df_index].get()
+            self.duplicate_rows_to_keep_vars[original_df_index].set(not current_keep_state)
+
+            # Update the Treeview checkbox display
+            new_display_value = "✓" if not current_keep_state else "☐"
+            values = list(self.duplicate_review_tree.item(item, 'values'))
+            values[0] = new_display_value # Assuming "Keep" is the first column
+            self.duplicate_review_tree.item(item, values=values)
 
     def browse_input_file(self):
         initial_dir = os.path.dirname(self.input_file_path.get()) if self.input_file_path.get() else os.path.expanduser('~')
@@ -421,7 +497,6 @@ class CleanItApp:
             self.input_file_path.set(file_path)
             self.update_status(f"Input file selected: {os.path.basename(file_path)}")
             self._save_config()
-            # Now, load the entire DataFrame and then update all widgets
             self._load_dataframe_and_update_widgets(file_path)
 
     def browse_output_folder(self):
@@ -446,7 +521,7 @@ class CleanItApp:
             else:
                 self.update_progress_status("Unsupported file type for loading.", 0)
                 messagebox.showerror("File Type Error", "Unsupported file type. Please select a .csv or .xlsx file.")
-                self.df = None # Clear df if unsupported
+                self.df = None
                 return
 
             if self.df.empty:
@@ -498,6 +573,10 @@ class CleanItApp:
             # --- Update Missing Values Treeview ---
             self._populate_missing_values_treeview()
 
+            # --- Clear Duplicate Review Treeview (reset for new file) ---
+            self._clear_duplicate_review_treeview()
+            self.apply_duplicates_button.config(state='disabled')
+
             # --- Update Sort Column Combobox ---
             self.sort_column_combobox['values'] = columns
             if columns:
@@ -511,19 +590,20 @@ class CleanItApp:
         except Exception as e:
             messagebox.showerror("Error Loading File", f"Could not load or read file: {e}")
             self.update_progress_status("Error loading file.", 0)
-            self.df = None # Clear df on error
+            self.df = None
             # Clear all dependent widgets
             for widget in self.date_columns_frame.winfo_children(): widget.destroy()
             self.date_column_vars.clear()
             for widget in self.duplicate_check_columns_frame.winfo_children(): widget.destroy()
             self.duplicate_check_column_vars.clear()
             self._clear_missing_values_treeview()
+            self._clear_duplicate_review_treeview()
             self.sort_column_combobox['values'] = []
             self.sort_column.set("")
 
     def _populate_missing_values_treeview(self):
         """Populates the Treeview with rows containing NaN values."""
-        self._clear_missing_values_treeview() # Clear previous data
+        self._clear_missing_values_treeview()
 
         if self.df is None or self.df.empty:
             return
@@ -532,33 +612,174 @@ class CleanItApp:
         missing_rows_df = self.df[self.df.isnull().any(axis=1)]
 
         if missing_rows_df.empty:
-            self.missing_values_tree.heading("#0", text="") # Clear default heading
-            self.missing_values_tree["columns"] = () # Clear column definitions
+            self.missing_values_tree.heading("#0", text="")
+            self.missing_values_tree["columns"] = ()
+            # Placeholder for "No empty cells" message
             ttk.Label(self.missing_values_tree.master, text="No empty cells found in file.", background=self.bg_color, foreground=self.fg_color).pack(pady=10)
             return
 
         # Define Treeview columns
         columns = self.df.columns.tolist()
         self.missing_values_tree["columns"] = columns
-        self.missing_values_tree.column("#0", width=0, stretch=tk.NO) # Hide default first column
+        self.missing_values_tree.column("#0", width=0, stretch=tk.NO)
         
         for col in columns:
             self.missing_values_tree.heading(col, text=col)
-            self.missing_values_tree.column(col, width=100, anchor='w') # Default width
+            self.missing_values_tree.column(col, width=100, anchor='w')
 
         # Insert data
         for original_idx, row in missing_rows_df.iterrows():
-            # Convert NaNs to empty strings for Treeview display
             display_values = ["" if pd.isna(val) else val for val in row.values.tolist()]
-            self.missing_values_tree.insert("", "end", iid=str(original_idx), values=display_values) # iid is original df index
+            self.missing_values_tree.insert("", "end", iid=str(original_idx), values=display_values)
 
     def _clear_missing_values_treeview(self):
         """Clears all data from the missing values Treeview."""
         if self.missing_values_tree:
             for item in self.missing_values_tree.get_children():
                 self.missing_values_tree.delete(item)
-            self.missing_values_tree["columns"] = () # Clear column definitions
-            self.missing_values_tree.heading("#0", text="") # Clear placeholder text
+            self.missing_values_tree["columns"] = ()
+            self.missing_values_tree.heading("#0", text="")
+            # Remove any "No empty cells" label if present
+            for widget in self.missing_values_tree.master.winfo_children():
+                if isinstance(widget, ttk.Label) and widget.cget("text") == "No empty cells found in file.":
+                    widget.destroy()
+
+    def _populate_duplicate_review_treeview(self):
+        """Populates the Treeview with duplicate rows for review."""
+        self._clear_duplicate_review_treeview()
+
+        if self.duplicate_review_df is None or self.duplicate_review_df.empty:
+            self.duplicate_review_tree.heading("#0", text="")
+            self.duplicate_review_tree["columns"] = ()
+            ttk.Label(self.duplicate_review_tree.master, text="No duplicates found for review.", background=self.bg_color, foreground=self.fg_color).pack(pady=10)
+            self.apply_duplicates_button.config(state='disabled')
+            return
+
+        # Define Treeview columns: "Keep" checkbox + original DataFrame columns
+        columns_to_display = ["Keep"] + self.duplicate_review_df.columns.tolist()
+        self.duplicate_review_tree["columns"] = columns_to_display
+        self.duplicate_review_tree.column("#0", width=0, stretch=tk.NO) # Hide default first column
+        
+        for col in columns_to_display:
+            self.duplicate_review_tree.heading(col, text=col)
+            if col == "Keep":
+                self.duplicate_review_tree.column(col, width=50, anchor='center')
+            else:
+                self.duplicate_review_tree.column(col, width=100, anchor='w')
+
+        self.duplicate_rows_to_keep_vars.clear()
+        
+        # Group duplicates to ensure at least one is kept from each group
+        # This uses the same subset_cols that were used to find the duplicates
+        subset_cols = [col_name for col_name, var in self.duplicate_check_column_vars.items() if var.get()]
+        
+        # Create a temporary DataFrame to find groups of duplicates
+        # Use the original (pre-cleaned) df for grouping to ensure correct original indices are used
+        temp_df = self.df.copy() 
+        
+        # Identify group IDs for all rows that are part of a duplicate set
+        # This will assign a unique ID to each group of identical rows (based on subset_cols)
+        # Rows that are not duplicates will get NaN, which is fine as we filter later.
+        temp_df['__dup_group_id'] = temp_df.groupby(subset_cols, dropna=False).ngroup()
+
+        # Iterate through unique group IDs that have duplicates
+        # We only care about groups where more than one row exists
+        duplicate_group_ids = temp_df[temp_df.duplicated(subset=subset_cols, keep=False)]['__dup_group_id'].unique()
+
+        for group_id in duplicate_group_ids:
+            group_rows = temp_df[temp_df['__dup_group_id'] == group_id]
+            
+            # For each group, we'll keep the first one by default, and mark others for deletion
+            first_in_group = True
+            for original_idx, row_data in group_rows.iterrows():
+                var = tk.BooleanVar(value=True if first_in_group else False) # Keep first by default
+                self.duplicate_rows_to_keep_vars[original_idx] = var
+                
+                display_keep = "✓" if var.get() else "☐"
+                # Ensure we display the original values from the self.df.columns, not temp_df's extra column
+                display_values = [display_keep] + ["" if pd.isna(val) else val for val in row_data[self.df.columns].values.tolist()]
+                
+                self.duplicate_review_tree.insert("", "end", iid=str(original_idx), values=display_values)
+                first_in_group = False
+
+        self.apply_duplicates_button.config(state='normal')
+
+    def _clear_duplicate_review_treeview(self):
+        """Clears all data from the duplicate review Treeview."""
+        if self.duplicate_review_tree:
+            for item in self.duplicate_review_tree.get_children():
+                self.duplicate_review_tree.delete(item)
+            self.duplicate_review_tree["columns"] = ()
+            self.duplicate_review_tree.heading("#0", text="")
+            for widget in self.duplicate_review_tree.master.winfo_children():
+                if isinstance(widget, ttk.Label) and widget.cget("text") == "No duplicates found for review.":
+                    widget.destroy()
+            self.duplicate_rows_to_keep_vars.clear()
+
+    def _apply_duplicate_changes(self):
+        """Applies user's duplicate review choices and continues processing."""
+        self.update_progress_status("Applying duplicate changes...", 0)
+        self.root.update_idletasks()
+
+        rows_to_keep_indices = [idx for idx, var in self.duplicate_rows_to_keep_vars.items() if var.get()]
+        
+        # --- Capture deleted indices for the report ---
+        deleted_indices = []
+        for original_idx, var in self.duplicate_rows_to_keep_vars.items():
+            if not var.get(): # If the user chose NOT to keep this row
+                deleted_indices.append(original_idx)
+        self.processing_metrics['deleted_duplicate_original_indices'] = sorted(deleted_indices)
+
+        # --- Create a temporary DataFrame with group IDs for validation ---
+        subset_cols = [col_name for col_name, var in self.duplicate_check_column_vars.items() if var.get()]
+        
+        # Use a copy of the *original* self.df to ensure correct grouping logic
+        # dropna=False ensures that rows with NaNs in subset_cols are also grouped
+        temp_df_with_groups = self.df.copy() 
+        temp_df_with_groups['__dup_group_id'] = temp_df_with_groups.groupby(subset_cols, dropna=False).ngroup()
+
+        # Identify all group IDs that were originally part of a duplicate set
+        original_duplicate_group_ids = temp_df_with_groups[temp_df_with_groups.duplicated(subset=subset_cols, keep=False)]['__dup_group_id'].unique()
+
+        # Get the group IDs of the rows that the user chose to keep
+        # We filter temp_df_with_groups by the indices the user chose to keep
+        kept_rows_with_groups = temp_df_with_groups.loc[rows_to_keep_indices]
+        kept_group_ids = kept_rows_with_groups['__dup_group_id'].unique() if not kept_rows_with_groups.empty else []
+
+        all_groups_covered = True
+        for group_id in original_duplicate_group_ids:
+            if group_id not in kept_group_ids:
+                all_groups_covered = False
+                break
+        
+        if not all_groups_covered:
+            messagebox.showwarning("Duplicate Review Error", "At least one row from each duplicate group must be kept. Please review again.")
+            self.update_progress_status("Error: Review incomplete.", 0)
+            # Clear the deleted indices if validation fails, as the changes aren't applied yet
+            self.processing_metrics['deleted_duplicate_original_indices'] = [] 
+            return
+
+        # --- Construct the final DataFrame after review ---
+        # Get rows that were never duplicates (based on the chosen subset_cols)
+        non_duplicate_rows = self.df[~self.df.duplicated(subset=subset_cols, keep=False)]
+        
+        # Get the rows that the user explicitly chose to keep from duplicate sets
+        rows_kept_from_duplicates = self.df.loc[rows_to_keep_indices]
+
+        # Combine non-duplicate rows with the ones chosen to be kept from duplicate sets
+        # Use pd.concat and then drop duplicates based on the index to handle potential overlaps
+        final_processed_df = pd.concat([non_duplicate_rows, rows_kept_from_duplicates]).drop_duplicates(keep='first').reset_index(drop=True)
+        
+        # Store metrics
+        # The number of duplicates removed is the difference between original rows and final rows
+        self.processing_metrics['num_duplicates_removed'] = self.processing_metrics['original_rows'] - len(final_processed_df)
+        self.processing_metrics['duplicates_reviewed'] = True
+        
+        self.update_progress_status("Duplicate review applied. Continuing processing...", 0)
+        self.root.update_idletasks()
+        
+        self._final_processing_steps(final_processed_df)
+
 
     def process_file(self):
         # Use self.df directly which has been loaded and potentially edited
@@ -567,12 +788,26 @@ class CleanItApp:
             self.update_progress_status("Error: No file loaded.", 0)
             return
 
-        output_folder = self.output_folder_path.get()
-        selected_strftime_format = self._date_format_map.get(self.selected_date_format_display.get())
-        sort_col = self.sort_column.get()
-        sort_asc = self.sort_order.get()
+        # Reset metrics for a new run
+        self.processing_metrics = {
+            'original_rows': len(self.df),
+            'whitespace_trimmed': self.do_trim_whitespace.get(),
+            'capitalization_applied': self.do_capitalize_strings.get(),
+            'date_formatted_cols': [],
+            'duplicate_removal_enabled': self.do_remove_duplicates.get(),
+            'duplicate_check_cols': [],
+            'num_duplicates_removed': 0, # Will be updated later
+            'duplicates_reviewed': False, # Will be updated later
+            'deleted_duplicate_original_indices': [], # NEW: To store original indices of deleted duplicates
+            'sorted_by': None,
+            'sorted_order': None,
+            'final_rows': 0
+        }
 
         # --- Validation ---
+        output_folder = self.output_folder_path.get()
+        selected_strftime_format = self._date_format_map.get(self.selected_date_format_display.get())
+        
         if not output_folder:
             messagebox.showwarning("Output Error", "Please select an output folder.")
             self.update_progress_status("Error: No output folder selected.", 0)
@@ -587,37 +822,74 @@ class CleanItApp:
                 messagebox.showwarning("Duplicate Check Error", "If 'Remove Duplicate Rows' is checked, you must select at least one column for duplicate checking.")
                 self.update_progress_status("Error: No columns selected for duplicate check.", 0)
                 return
+            self.processing_metrics['duplicate_check_cols'] = selected_duplicate_columns
 
         self.update_progress_status("Starting processing...", 0)
         self.root.update_idletasks()
 
         try:
-            # Create a copy of the DataFrame to apply cleaning steps, preserving self.df for re-runs
-            processed_df = self.df.copy()
-            original_rows = len(processed_df)
+            # Create a copy of the DataFrame to apply initial cleaning steps
+            processed_df_stage1 = self.df.copy()
             current_progress = 20
 
             # --- Step 1: Trim Whitespace (Conditional) ---
             if self.do_trim_whitespace.get():
                 self.update_progress_status("Trimming whitespace...", current_progress)
-                for col in processed_df.select_dtypes(include=['object']).columns:
-                    # Apply .str.strip() directly. This handles NaNs correctly by leaving them as NaN.
-                    processed_df[col] = processed_df[col].str.strip() # <--- CORRECTED
+                for col in processed_df_stage1.select_dtypes(include=['object']).columns:
+                    processed_df_stage1[col] = processed_df_stage1[col].str.strip()
             current_progress += 10
-
 
             # --- Step 2: Capitalize String Columns (Conditional) ---
             if self.do_capitalize_strings.get():
                 self.update_progress_status("Capitalizing text fields...", current_progress)
-                for col in processed_df.select_dtypes(include=['object']).columns:
-                    # Apply .str.title() directly. This handles NaNs correctly by leaving them as NaN.
-                    processed_df[col] = processed_df[col].str.title() # <--- CORRECTED
+                for col in processed_df_stage1.select_dtypes(include=['object']).columns:
+                    processed_df_stage1[col] = processed_df_stage1[col].str.title()
             current_progress += 10
 
+            # --- Step 3: Duplicate Review (Interactive) ---
+            if self.do_remove_duplicates.get():
+                self.update_progress_status("Checking for duplicates...", current_progress)
+                subset_cols = [col_name for col_name, var in self.duplicate_check_column_vars.items() if var.get()]
+                
+                # Find all rows involved in a duplicate set
+                self.duplicate_review_df = processed_df_stage1[processed_df_stage1.duplicated(subset=subset_cols, keep=False)].copy()
 
-            # --- Step 3: Date Column Processing ---
-            processed_date_cols = []
+                if not self.duplicate_review_df.empty:
+                    self.update_progress_status(f"{len(self.duplicate_review_df)} rows involved in duplicates. Review required.", current_progress)
+                    self._populate_duplicate_review_treeview()
+                    self.notebook.select(2) # Switch to Duplicate Review tab
+                    self.process_button.config(state='disabled') # Disable main process button
+                    self.apply_duplicates_button.config(state='normal') # Enable apply button
+                    return # Pause execution until user reviews
+                else:
+                    self.update_status("No duplicates found for review. Proceeding...")
+                    self.processing_metrics['num_duplicates_removed'] = 0
+                    self.processing_metrics['duplicates_reviewed'] = True # Mark as reviewed (even if empty)
+                    self.processing_metrics['deleted_duplicate_original_indices'] = [] # No duplicates, so none deleted
+            
+            # If no duplicates to review or duplicate removal is off, proceed directly
+            self.update_status("Proceeding to final processing steps...")
+            self._final_processing_steps(processed_df_stage1)
+
+        except Exception as e:
+            messagebox.showerror("An Error Occurred During Initial Processing", f"An unexpected error occurred: {e}")
+            self.update_progress_status(f"Error: {e}", 0)
+            self.process_button.config(state='normal') # Re-enable button on error
+            self.apply_duplicates_button.config(state='disabled') # Disable apply button on error
+        finally:
+            self.progress_bar['value'] = 0
+            self.root.update_idletasks()
+
+    def _final_processing_steps(self, processed_df):
+        """Applies date formatting, sorting, saves file, and generates report."""
+        try:
+            current_progress = 60 # Starting after initial cleaning and duplicate handling
+            original_rows_for_report = self.processing_metrics['original_rows'] # Use original from metrics
+
+            # --- Step 4: Date Column Processing ---
             self.update_progress_status("Formatting selected date columns...", current_progress)
+            processed_date_cols = []
+            selected_strftime_format = self._date_format_map.get(self.selected_date_format_display.get())
             for col_name, var in self.date_column_vars.items():
                 if var.get() and col_name in processed_df.columns:
                     processed_date_cols.append(col_name)
@@ -629,88 +901,139 @@ class CleanItApp:
                                                f"Could not apply format to column '{col_name}'. "
                                                f"Error: {e}\nInvalid dates will be cleared.")
                         processed_df[col_name] = processed_df[col_name].fillna('')
-            current_progress += 20
-
-            # --- Step 4: Duplicate Detection and Removal (Conditional) ---
-            num_removed_duplicates = 0
-            if self.do_remove_duplicates.get():
-                self.update_progress_status("Detecting and removing duplicates...", current_progress)
-                subset_cols = [col_name for col_name, var in self.duplicate_check_column_vars.items() if var.get()]
-                valid_subset_cols = [col for col in subset_cols if col in processed_df.columns]
-                
-                if not valid_subset_cols:
-                    messagebox.showwarning("Duplicate Check Warning", "No valid columns selected for duplicate checking. Skipping duplicate removal.")
-                else:
-                    processed_df = processed_df.drop_duplicates(subset=valid_subset_cols, keep='first')
-                    num_removed_duplicates = original_rows - len(processed_df)
-            
-            cleaned_rows = len(processed_df)
-            current_progress += 20
+            self.processing_metrics['date_formatted_cols'] = processed_date_cols
+            current_progress += 10
 
             # --- Step 5: Sort Data ---
+            sort_col = self.sort_column.get()
+            sort_asc = self.sort_order.get()
             if sort_col and sort_col in processed_df.columns:
                 self.update_progress_status(f"Sorting data by '{sort_col}'...", current_progress)
                 processed_df = processed_df.sort_values(by=sort_col, ascending=sort_asc)
-            current_progress += 5
+                self.processing_metrics['sorted_by'] = sort_col
+                self.processing_metrics['sorted_order'] = 'Ascending' if sort_asc else 'Descending'
+            current_progress += 10
+
+            self.processing_metrics['final_rows'] = len(processed_df)
 
             # --- Step 6: Save Cleaned DataFrame ---
             self.update_progress_status("Saving cleaned file...", current_progress)
             original_filename_with_ext = os.path.basename(self.input_file_path.get())
             original_name_without_ext, _ = os.path.splitext(original_filename_with_ext)
-            cleaned_filename = f"cleaned.{original_name_without_ext}.xlsx"
-            output_file_path = os.path.join(output_folder, cleaned_filename)
-            processed_df.to_excel(output_file_path, index=False)
-            current_progress = 100
+            
+            output_ext = self.output_file_format.get()
+            cleaned_filename = f"cleaned.{original_name_without_ext}{output_ext}"
+            output_file_path = os.path.join(self.output_folder_path.get(), cleaned_filename)
 
-            # --- Final Status and Message ---
-            self.update_progress_status("Processing complete!", current_progress)
+            if output_ext == ".xlsx":
+                processed_df.to_excel(output_file_path, index=False)
+            elif output_ext == ".csv":
+                processed_df.to_csv(output_file_path, index=False)
+            current_progress += 10
 
+            # --- Step 7: Generate Processing Report (Conditional) ---
+            if self.generate_report.get():
+                self.update_progress_status("Generating processing report...", current_progress)
+                self._generate_processing_report(output_file_path, original_name_without_ext)
+            current_progress += 10
+            
+            self.update_progress_status("Processing complete!", 100)
+
+            # --- Final Summary Message ---
             summary_message = (
                 f"Successfully processed:\n"
-                f"Original rows: {original_rows}\n"
+                f"Original rows: {original_rows_for_report}\n"
             )
-            if processed_date_cols:
-                summary_message += f"Processed date columns: {', '.join(processed_date_cols)} (formatted to '{self.selected_date_format_display.get()}')\n"
-            else:
-                summary_message += "No 'date' columns selected or processed.\n"
-
-            if self.do_remove_duplicates.get():
-                if num_removed_duplicates > 0:
-                    summary_message += (
-                        f"Duplicates removed: {num_removed_duplicates}\n"
-                        f"Final rows: {cleaned_rows}\n"
-                        f"Cleaned file saved to:\n{output_file_path}"
-                    )
-                else:
-                    summary_message += (
-                        f"No duplicates found or removed (based on selected columns).\n"
-                        f"Final rows: {cleaned_rows}\n"
-                        f"Cleaned file saved to:\n{output_file_path}"
-                    )
-            else:
-                 summary_message += (
-                    f"Duplicate removal was skipped.\n"
-                    f"Final rows: {cleaned_rows}\n"
-                    f"Cleaned file saved to:\n{output_file_path}"
-                )
-
-            if sort_col:
-                summary_message += f"\nData sorted by '{sort_col}' ({'Ascending' if sort_asc else 'Descending'})."
+            if self.processing_metrics['duplicates_reviewed']: # Was duplicate removal enabled and/or reviewed?
+                 if self.processing_metrics['num_duplicates_removed'] > 0:
+                     summary_message += f"Duplicates removed: {self.processing_metrics['num_duplicates_removed']}\n"
+                 else:
+                     summary_message += "No duplicates removed (or found).\n"
+            else: # Duplicate removal was skipped entirely
+                summary_message += "Duplicate removal was skipped.\n"
+            
+            summary_message += (
+                f"Final rows: {self.processing_metrics['final_rows']}\n"
+                f"Cleaned file saved to:\n{output_file_path}"
+            )
+            if self.generate_report.get():
+                report_name = f"{original_name_without_ext}_report.docx"
+                summary_message += f"\nProcessing report saved as:\n{os.path.join(self.output_folder_path.get(), report_name)}"
 
             messagebox.showinfo("Processing Complete", summary_message)
 
-        except FileNotFoundError:
-            messagebox.showerror("Error", "The specified file was not found.")
-            self.update_progress_status("Error: File not found.", 0)
-        except pd.errors.EmptyDataError:
-            messagebox.showerror("Error", "The selected file is empty or corrupted.")
-            self.update_progress_status("Error: Empty or corrupted file.", 0)
         except Exception as e:
-            messagebox.showerror("An Error Occurred", f"An unexpected error occurred: {e}")
+            messagebox.showerror("An Error Occurred During Final Processing", f"An unexpected error occurred: {e}")
             self.update_progress_status(f"Error: {e}", 0)
         finally:
+            self.process_button.config(state='normal') # Re-enable main process button
+            self.apply_duplicates_button.config(state='disabled') # Ensure apply button is disabled
             self.progress_bar['value'] = 0
             self.root.update_idletasks()
+
+    def _generate_processing_report(self, cleaned_file_path, original_name_without_ext):
+        """Generates a Word document report of the cleaning process."""
+        try:
+            document = Document()
+            
+            # Title
+            document.add_heading(f"Processing Report for '{original_name_without_ext}'", level=1)
+            document.add_paragraph(f"Generated by CleanIt on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            document.add_paragraph("---")
+
+            # Summary Section
+            document.add_heading("Summary", level=2)
+            document.add_paragraph(f"Original Rows: {self.processing_metrics.get('original_rows', 'N/A')}")
+            document.add_paragraph(f"Final Rows: {self.processing_metrics.get('final_rows', 'N/A')}")
+            document.add_paragraph(f"Cleaned File Saved To: {cleaned_file_path}")
+            document.add_paragraph("---")
+
+            # Cleaning Operations Details
+            document.add_heading("Cleaning Operations Performed", level=2)
+
+            document.add_paragraph(f"Whitespace Trimming: {'Enabled' if self.processing_metrics.get('whitespace_trimmed') else 'Disabled'}")
+            document.add_paragraph(f"Text Field Capitalization: {'Enabled' if self.processing_metrics.get('capitalization_applied') else 'Disabled'}")
+            
+            dup_status = "Enabled" if self.processing_metrics.get('duplicate_removal_enabled') else "Disabled"
+            document.add_paragraph(f"Duplicate Removal: {dup_status}")
+            if self.processing_metrics.get('duplicate_removal_enabled'):
+                document.add_paragraph(f"  - Columns used for duplicate check: {', '.join(self.processing_metrics.get('duplicate_check_cols', []))}")
+                document.add_paragraph(f"  - Duplicates Removed: {self.processing_metrics.get('num_duplicates_removed', 0)}")
+                document.add_paragraph(f"  - Interactive Review Performed: {'Yes' if self.processing_metrics.get('duplicates_reviewed') else 'No (skipped due to no duplicates)'}")
+                
+                # NEW: Add deleted duplicate row indices
+                deleted_dup_indices = self.processing_metrics.get('deleted_duplicate_original_indices', [])
+                if deleted_dup_indices:
+                    # Convert list of integers to string for display, e.g., "1, 5, 10-12"
+                    # For simplicity, just list them, but could make it fancier
+                    indices_str = ", ".join(map(str, deleted_dup_indices))
+                    document.add_paragraph(f"  - Original row indices of deleted duplicates: {indices_str}")
+                else:
+                    document.add_paragraph("  - No specific rows deleted as duplicates (either none found or all kept during review).")
+
+
+            date_cols = self.processing_metrics.get('date_formatted_cols', [])
+            date_format_used = self.selected_date_format_display.get()
+            document.add_paragraph(f"Date Formatting: {'Applied' if date_cols else 'Not Applied'}")
+            if date_cols:
+                document.add_paragraph(f"  - Columns Formatted: {', '.join(date_cols)}")
+                document.add_paragraph(f"  - Format Applied: '{date_format_used}'")
+
+            sort_col = self.processing_metrics.get('sorted_by')
+            if sort_col:
+                document.add_paragraph(f"Data Sorted By: '{sort_col}' ({self.processing_metrics.get('sorted_order')})")
+            else:
+                document.add_paragraph("Data Sorting: Not Applied")
+            
+            # Save the document
+            report_filename = f"{original_name_without_ext}_report.docx"
+            report_path = os.path.join(self.output_folder_path.get(), report_filename)
+            document.save(report_path)
+            self.update_status(f"Processing report saved to: {report_path}")
+
+        except Exception as e:
+            messagebox.showerror("Report Generation Error", f"Could not generate processing report: {e}")
+            self.update_status(f"Error generating report: {e}")
 
 
     def update_progress_status(self, message, value):
